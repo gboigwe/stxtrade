@@ -204,7 +204,7 @@
                 source-count: uint,
                 prices: (list 10 uint),
                 timestamps: (list 10 uint) }))
-    (let ((current-time (unwrap! (get-block-info? time (- block-height u1)) u0)))
+    (let ((current-time (unwrap-panic (get-block-info? time (- block-height u1)))))
         (< (- current-time (get last-update feed-data)) 
            (var-get price-validity-period))))
 
@@ -212,7 +212,7 @@
 (define-private (is-heartbeat-valid 
     (source { is-active: bool, last-update: uint, weight: uint }) 
     (current-time (optional uint)))
-    (let ((time (unwrap! current-time false)))
+    (let ((time (unwrap-panic current-time)))
         (or (is-eq (get last-update source) u0)
             (< (- time (get last-update source)) 
                (var-get heartbeat-interval)))))
