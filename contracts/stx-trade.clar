@@ -1,34 +1,51 @@
-;; Title: STX-Derivatives Platform Core Contracts
-;; Description: Implementation of core derivatives trading functionality
-
 ;; -----------------------------
-;; Constants and Traits
+;; Constants and Error Codes
 ;; -----------------------------
 
-;; Define error codes
+;; Platform error codes
 (define-constant ERR-UNAUTHORIZED (err u100))
 (define-constant ERR-INVALID-AMOUNT (err u101))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u102))
 (define-constant ERR-INVALID-POSITION (err u103))
 (define-constant ERR-INSUFFICIENT-COLLATERAL (err u104))
 
-;; Minimum collateral ratio (150%)
-(define-constant MIN-COLLATERAL-RATIO u150)
+;; Oracle error codes
+(define-constant ERR-INVALID-PRICE (err u201))
+(define-constant ERR-STALE-PRICE (err u202))
+(define-constant ERR-INSUFFICIENT-SOURCES (err u203))
+(define-constant ERR-PRICE-DEVIATION (err u204))
+(define-constant ERR-UNAUTHORIZED-SOURCE (err u205))
 
-;; Position types
+;; Trading constants
+(define-constant MIN-COLLATERAL-RATIO u150)  ;; 150%
 (define-constant TYPE-LONG u1)
 (define-constant TYPE-SHORT u2)
 
 ;; -----------------------------
-;; Data Maps and Variables
+;; Data Variables
 ;; -----------------------------
 
-;; Track user balances
+;; Platform state
+(define-data-var contract-owner principal tx-sender)
+(define-data-var platform-paused bool false)
+(define-data-var position-counter uint u0)
+
+;; Oracle configuration
+(define-data-var min-oracle-sources uint u3)
+(define-data-var price-validity-period uint u300)  ;; 5 minutes
+(define-data-var max-price-deviation uint u1000)   ;; 10%
+(define-data-var heartbeat-interval uint u300)     ;; 5 minutes
+
+;; -----------------------------
+;; Data Maps
+;; -----------------------------
+
+;; User balances
 (define-map balances 
     principal 
     { stx-balance: uint })
 
-;; Track positions
+;; Trading positions
 (define-map positions 
     uint 
     { owner: principal,
@@ -39,90 +56,117 @@
       collateral: uint,
       liquidation-price: uint })
 
-;; Position counter
-(define-data-var position-counter uint u0)
+;; Oracle sources
+(define-map price-sources
+    principal
+    { is-active: bool,
+      last-update: uint,
+      weight: uint })
 
-;; Contract admin
-(define-data-var contract-owner principal tx-sender)
-
-;; Price oracle (simplified for testnet)
-(define-data-var current-price uint u0)
-
-;; -----------------------------
-;; Read-Only Functions
-;; -----------------------------
-
-(define-read-only (get-balance (user principal))
-    (default-to 
-        { stx-balance: u0 }
-        (map-get? balances user)))
-
-(define-read-only (get-position (position-id uint))
-    (map-get? positions position-id))
-
-(define-read-only (get-current-price)
-    (ok (var-get current-price)))
-
-;; Calculate liquidation price
-(define-read-only (calculate-liquidation-price 
-    (entry-price uint) 
-    (position-type uint) 
-    (leverage uint))
-    (if (is-eq position-type TYPE-LONG)
-        ;; Long position liquidation price
-        (ok (/ (* entry-price (- u100 (/ u100 leverage))) u100))
-        ;; Short position liquidation price
-        (ok (/ (* entry-price (+ u100 (/ u100 leverage))) u100))))
+;; Price data
+(define-map price-feeds
+    uint  ;; feed-id
+    { current-price: uint,
+      last-update: uint,
+      source-count: uint,
+      prices: (list 10 uint),     ;; Price history
+      timestamps: (list 10 uint)  ;; Timestamp history
+    })
 
 ;; -----------------------------
-;; Public Functions
+;; Oracle Management Functions
 ;; -----------------------------
 
-;; Deposit collateral
-(define-public (deposit-collateral (amount uint))
-    (let ((current-balance (get stx-balance (get-balance tx-sender))))
-        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-        (ok (map-set balances 
-            tx-sender 
-            { stx-balance: (+ current-balance amount) }))))
+;; Register price source
+(define-public (register-price-source (source principal) (weight uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
+        (map-set price-sources
+            source
+            { is-active: true,
+              last-update: u0,
+              weight: weight })
+        (ok true)))
 
-;; Withdraw collateral
-(define-public (withdraw-collateral (amount uint))
-    (let ((current-balance (get stx-balance (get-balance tx-sender))))
-        (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
-        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
-        (ok (map-set balances 
-            tx-sender 
-            { stx-balance: (- current-balance amount) }))))
+;; Submit price update
+(define-public (submit-price-update (feed-id uint) (price uint))
+    (let ((source (unwrap! (map-get? price-sources tx-sender) ERR-UNAUTHORIZED-SOURCE))
+          (current-time (get-block-info? time (- block-height u1)))
+          (feed-data (default-to 
+                      { current-price: u0, 
+                        last-update: u0, 
+                        source-count: u0,
+                        prices: (list u0),
+                        timestamps: (list u0) }
+                      (map-get? price-feeds feed-id))))
+        
+        ;; Verify source is active
+        (asserts! (get is-active source) ERR-UNAUTHORIZED-SOURCE)
+        
+        ;; Check heartbeat
+        (asserts! (is-heartbeat-valid source current-time) ERR-STALE-PRICE)
+        
+        ;; Verify price deviation
+        (asserts! (is-price-deviation-acceptable 
+                   price 
+                   (get current-price feed-data)) 
+                 ERR-PRICE-DEVIATION)
+        
+        ;; Update price feed
+        (map-set price-feeds feed-id
+            { current-price: price,
+              last-update: (unwrap! current-time ERR-INVALID-PRICE),
+              source-count: (+ (get source-count feed-data) u1),
+              prices: (unwrap! (as-max-len? 
+                               (concat (list price) 
+                                      (get prices feed-data)) u10)
+                             ERR-INVALID-PRICE),
+              timestamps: (unwrap! (as-max-len? 
+                                   (concat (list (unwrap! current-time (err u255))) 
+                                          (get timestamps feed-data)) u10)
+                                 ERR-INVALID-PRICE) })
+        
+        ;; Update source
+        (map-set price-sources tx-sender
+            (merge source
+                  { last-update: (unwrap! current-time (err u256)) }))
+        
+        (ok true)))
 
-;; Open position
+;; -----------------------------
+;; Trading Functions
+;; -----------------------------
+
+;; Open position with oracle price
 (define-public (open-position 
     (position-type uint)
     (size uint)
     (leverage uint))
-    (let 
-        ((required-collateral (/ (* size (var-get current-price)) leverage))
-         (current-balance (get stx-balance (get-balance tx-sender)))
-         (position-id (+ (var-get position-counter) u1))
-         (entry-price (var-get current-price)))
+    (let ((current-price (unwrap! (get-valid-price u1) ERR-INVALID-PRICE))
+          (required-collateral (/ (* size current-price) leverage))
+          (current-balance (get stx-balance (get-balance tx-sender)))
+          (position-id (+ (var-get position-counter) u1)))
         
-        ;; Verify conditions
+        ;; Verify platform state
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        ;; Verify position parameters
         (asserts! (or (is-eq position-type TYPE-LONG) 
-                     (is-eq position-type TYPE-SHORT)) ERR-INVALID-POSITION)
-        (asserts! (>= current-balance required-collateral) ERR-INSUFFICIENT-COLLATERAL)
+                     (is-eq position-type TYPE-SHORT)) 
+                 ERR-INVALID-POSITION)
+        (asserts! (>= current-balance required-collateral) 
+                 ERR-INSUFFICIENT-COLLATERAL)
         
         ;; Calculate liquidation price
-        (let ((liquidation-price (unwrap! (calculate-liquidation-price 
-                                         entry-price 
-                                         position-type 
-                                         leverage) ERR-INVALID-POSITION)))
+        (let ((liquidation-price 
+               (calculate-liquidation-price current-price position-type leverage)))
             
             ;; Create position
             (map-set positions position-id
                 { owner: tx-sender,
                   position-type: position-type,
                   size: size,
-                  entry-price: entry-price,
+                  entry-price: current-price,
                   leverage: leverage,
                   collateral: required-collateral,
                   liquidation-price: liquidation-price })
@@ -132,61 +176,76 @@
                 tx-sender 
                 { stx-balance: (- current-balance required-collateral) })
             
-            ;; Increment position counter
+            ;; Update counter
             (var-set position-counter position-id)
             (ok position-id))))
 
-;; Close position
-(define-public (close-position (position-id uint))
-    (let ((position (unwrap! (get-position position-id) ERR-INVALID-POSITION)))
-        ;; Verify owner
-        (asserts! (is-eq (get owner position) tx-sender) ERR-UNAUTHORIZED)
+;; -----------------------------
+;; Helper Functions
+;; -----------------------------
+
+;; Get valid price
+(define-read-only (get-valid-price (feed-id uint))
+    (let ((feed-data (unwrap! (map-get? price-feeds feed-id) ERR-INVALID-PRICE)))
+        ;; Verify price freshness
+        (asserts! (is-price-fresh feed-data) ERR-STALE-PRICE)
         
-        ;; Calculate PnL
-        (let ((pnl (calculate-pnl position)))
-            ;; Return collateral + PnL
-            (try! (as-contract 
-                   (stx-transfer? 
-                    (+ (get collateral position) pnl) 
-                    tx-sender 
-                    tx-sender)))
-            
-            ;; Delete position
-            (map-delete positions position-id)
-            (ok true))))
+        ;; Verify minimum sources
+        (asserts! (>= (get source-count feed-data) 
+                     (var-get min-oracle-sources)) 
+                 ERR-INSUFFICIENT-SOURCES)
+        
+        (ok (get current-price feed-data))))
 
-;; -----------------------------
-;; Private Functions
-;; -----------------------------
+;; Check price freshness
+(define-private (is-price-fresh 
+    (feed-data { current-price: uint,
+                last-update: uint,
+                source-count: uint,
+                prices: (list 10 uint),
+                timestamps: (list 10 uint) }))
+    (let ((current-time (unwrap! (get-block-info? time (- block-height u1)) u0)))
+        (< (- current-time (get last-update feed-data)) 
+           (var-get price-validity-period))))
 
-;; Calculate PnL (simplified)
-(define-private (calculate-pnl (position {owner: principal, 
-                                        position-type: uint,
-                                        size: uint,
-                                        entry-price: uint,
-                                        leverage: uint,
-                                        collateral: uint,
-                                        liquidation-price: uint}))
-    (let ((current-price-local (var-get current-price))
-          (price-diff (if (is-eq (get position-type position) TYPE-LONG)
-                         (- current-price-local (get entry-price position))
-                         (- (get entry-price position) current-price-local))))
-        (* price-diff (get size position))))
+;; Validate heartbeat
+(define-private (is-heartbeat-valid 
+    (source { is-active: bool, last-update: uint, weight: uint }) 
+    (current-time (optional uint)))
+    (let ((time (unwrap! current-time false)))
+        (or (is-eq (get last-update source) u0)
+            (< (- time (get last-update source)) 
+               (var-get heartbeat-interval)))))
 
-;; -----------------------------
-;; Admin Functions
-;; -----------------------------
+;; Check price deviation
+(define-private (is-price-deviation-acceptable (new-price uint) (old-price uint))
+    (if (is-eq old-price u0)
+        true
+        (let ((deviation (calculate-deviation new-price old-price)))
+            (<= deviation (var-get max-price-deviation)))))
 
-;; Update price (would be replaced by oracle in production)
-(define-public (update-price (new-price uint))
-    (begin
-        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
-        (var-set current-price new-price)
-        (ok true)))
+;; Calculate price deviation
+(define-private (calculate-deviation (price-a uint) (price-b uint))
+    (let ((diff (if (> price-a price-b)
+                   (- price-a price-b)
+                   (- price-b price-a))))
+        (* (/ (* diff u10000) price-b) u1)))  ;; Convert to basis points
 
-;; Update contract owner
-(define-public (set-contract-owner (new-owner principal))
-    (begin
-        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
-        (var-set contract-owner new-owner)
-        (ok true)))
+;; Calculate liquidation price
+(define-private (calculate-liquidation-price 
+    (entry-price uint) 
+    (position-type uint) 
+    (leverage uint))
+    (if (is-eq position-type TYPE-LONG)
+        (/ (* entry-price (- u100 (/ u100 leverage))) u100)
+        (/ (* entry-price (+ u100 (/ u100 leverage))) u100)))
+
+;; Get user balance
+(define-read-only (get-balance (user principal))
+    (default-to 
+        { stx-balance: u0 }
+        (map-get? balances user)))
+
+;; Get position details
+(define-read-only (get-position (position-id uint))
+    (map-get? positions position-id))
